@@ -13,9 +13,10 @@ Lancement :
 import io
 import os
 import re
+import shutil
 import tempfile
 import zipfile
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import requests
 import streamlit as st
@@ -41,15 +42,44 @@ st.caption(
 # Utilitaires
 # ─────────────────────────────────────────────
 
+def find_ffmpeg() -> str | None:
+    """
+    Détecte le chemin de ffmpeg dans les emplacements courants.
+    Retourne le chemin du dossier contenant ffmpeg, ou None si introuvable.
+    """
+    found = shutil.which("ffmpeg")
+    if found:
+        return os.path.dirname(found)
+    if os.path.exists("/opt/homebrew/bin/ffmpeg"):
+        return "/opt/homebrew/bin"
+    if os.path.exists("/usr/local/bin/ffmpeg"):
+        return "/usr/local/bin"
+    if os.path.exists("/usr/bin/ffmpeg"):
+        return "/usr/bin"
+    return None
+
+
+FFMPEG_LOCATION = find_ffmpeg()
+
+# Diagnostic ffmpeg visible dès l'ouverture
+if FFMPEG_LOCATION:
+    st.success(f"✅ ffmpeg détecté : `{FFMPEG_LOCATION}`")
+else:
+    st.error(
+        "❌ ffmpeg introuvable. "
+        "Installe-le : `brew install ffmpeg` (Mac) ou `apt install ffmpeg` (Linux)."
+    )
+
+
 def sanitize_filename(name: str) -> str:
     """Nettoie un nom de fichier pour éviter les caractères illégaux."""
     name = re.sub(r'[\\/*?:"<>|]', "_", name)
-    return name.strip()[:120]  # limite raisonnable
+    return name.strip()[:120]
 
 
 def get_ydl_opts(output_dir: str) -> dict:
     """Options yt-dlp communes pour l'extraction audio en MP3."""
-    return {
+    opts = {
         "format": "bestaudio/best",
         "postprocessors": [
             {
@@ -61,30 +91,32 @@ def get_ydl_opts(output_dir: str) -> dict:
         "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
-        "ignoreerrors": True,   # continue même si une URL échoue
-        "noplaylist": False,    # accepte les playlists si yt-dlp les détecte
+        "ignoreerrors": True,
+        "noplaylist": False,
     }
+    if FFMPEG_LOCATION:
+        opts["ffmpeg_location"] = FFMPEG_LOCATION
+    return opts
 
 
 def download_single_audio(url: str, output_dir: str) -> tuple[bool, str, str]:
     """
     Télécharge l'audio d'une URL.
     Retourne (succès, titre, chemin_fichier_mp3).
+    En cas d'échec, le 3e élément contient le message d'erreur détaillé.
     """
     try:
-        with yt_dlp.YoutubeDL(get_ydl_opts(output_dir)) as ydl:
+        opts = get_ydl_opts(output_dir)
+        opts["ignoreerrors"] = False
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if info is None:
-                return False, "", ""
+                return False, "", "yt-dlp n'a pas pu extraire d'informations pour cette URL."
             title = info.get("title", "audio_sans_titre")
-            # yt-dlp renomme l'extension en .mp3 après post-traitement
-            mp3_path = os.path.join(output_dir, sanitize_filename(title) + ".mp3")
-            # Cherche le fichier réellement créé (le titre peut différer légèrement)
             for f in os.listdir(output_dir):
                 if f.endswith(".mp3"):
-                    mp3_path = os.path.join(output_dir, f)
-                    break
-            return True, title, mp3_path
+                    return True, title, os.path.join(output_dir, f)
+            return False, title, "Le fichier MP3 n'a pas été créé — ffmpeg a peut-être échoué."
     except Exception as exc:
         return False, "", str(exc)
 
@@ -92,11 +124,6 @@ def download_single_audio(url: str, output_dir: str) -> tuple[bool, str, str]:
 def scrape_video_urls(page_url: str, session: requests.Session) -> list[str]:
     """
     Scrape une page HTML et extrait les URLs de vidéos candidates.
-    Stratégie multi-couches :
-      1. Balises <video> et <source>
-      2. Attributs data-* contenant « video » ou « src »
-      3. Liens <a href> pointant vers des extensions vidéo connues
-      4. Pattern spécifique videos.senat.fr (liens /video.XXXXXXX)
     """
     found: list[str] = []
 
@@ -120,7 +147,7 @@ def scrape_video_urls(page_url: str, session: requests.Session) -> list[str]:
         if src:
             add(src)
 
-    # 2. Liens <a> vers des fichiers vidéo ou pages vidéo
+    # 2. Liens <a> vers des fichiers vidéo
     video_extensions = re.compile(
         r"\.(mp4|webm|ogv|avi|mov|mkv|flv|m4v|ts)(\?.*)?$", re.IGNORECASE
     )
@@ -129,16 +156,15 @@ def scrape_video_urls(page_url: str, session: requests.Session) -> list[str]:
         if video_extensions.search(href):
             add(href)
 
-    # 3. Pattern Sénat : liens vers /video.XXXXXX (page de la vidéo)
+    # 3. Pattern Sénat : liens vers /video.XXXXXX
     senat_pattern = re.compile(r"/video\.\w+", re.IGNORECASE)
     for a in soup.find_all("a", href=True):
         if senat_pattern.search(a["href"]):
             add(a["href"])
 
-    # 4. iframes embarquées (cas fréquent pour les players externes)
+    # 4. iframes de players vidéo
     for iframe in soup.find_all("iframe", src=True):
         iframe_src = iframe["src"]
-        # On inclut les iframes qui ressemblent à des players vidéo
         if any(
             kw in iframe_src
             for kw in ["video", "player", "embed", "youtube", "vimeo", "dailymotion"]
@@ -149,22 +175,15 @@ def scrape_video_urls(page_url: str, session: requests.Session) -> list[str]:
 
 
 def build_paginated_urls(base_url: str, num_pages: int) -> list[str]:
-    """
-    Génère les URLs paginées.
-    Essaie d'abord le paramètre GET 'page', sinon 'p'.
-    """
+    """Génère les URLs paginées avec le paramètre GET 'page'."""
     separator = "&" if "?" in base_url else "?"
-    pages = []
-    for i in range(1, num_pages + 1):
-        pages.append(f"{base_url}{separator}page={i}")
-    return pages
+    return [f"{base_url}{separator}page={i}" for i in range(1, num_pages + 1)]
 
 
-def download_multiple(urls: list[str], output_dir: str, progress_bar, status_text) -> list[str]:
-    """
-    Télécharge l'audio pour une liste d'URLs.
-    Retourne la liste des fichiers MP3 créés.
-    """
+def download_multiple(
+    urls: list[str], output_dir: str, progress_bar, status_text
+) -> list[str]:
+    """Télécharge l'audio pour une liste d'URLs. Retourne la liste des MP3 créés."""
     mp3_files: list[str] = []
     total = len(urls)
 
@@ -176,7 +195,7 @@ def download_multiple(urls: list[str], output_dir: str, progress_bar, status_tex
         if success and mp3_path and os.path.isfile(mp3_path):
             mp3_files.append(mp3_path)
         else:
-            st.warning(f"⚠️ Échec pour : {url}")
+            st.warning(f"⚠️ Échec pour : {url}\n{mp3_path}")
 
     return mp3_files
 
@@ -235,11 +254,8 @@ with tab_single:
                             type="primary",
                         )
                     else:
-                        st.error(
-                            "❌ Échec du téléchargement. "
-                            "Vérifie que l'URL est accessible et que ffmpeg est installé."
-                        )
-                        if mp3_path:  # mp3_path contient le message d'erreur ici
+                        st.error("❌ Échec du téléchargement.")
+                        if mp3_path:
                             st.code(mp3_path)
 
 
@@ -271,12 +287,6 @@ with tab_multi:
         )
 
     with st.expander("⚙️ Options avancées"):
-        st.markdown(
-            "**Note sur le scraping :** Le scraper détecte automatiquement les vidéos "
-            "les plus courantes. Pour `videos.senat.fr`, il cherche les liens `/video.XXXXX` "
-            "caractéristiques du site. Si aucune vidéo n't'est trouvée, inspecte le HTML "
-            "de la page et ajuste le code dans `scrape_video_urls()`."
-        )
         deduplicate = st.checkbox("Dédoublonner les URLs trouvées", value=True)
         max_videos = st.number_input(
             "Limite de vidéos (0 = illimité)",
@@ -299,7 +309,6 @@ with tab_multi:
                 }
             )
 
-            # Étape 1 : scraping de toutes les pages
             all_video_urls: list[str] = []
             page_urls = build_paginated_urls(page_url_input.strip(), int(num_pages))
 
@@ -324,9 +333,8 @@ with tab_multi:
             if not all_video_urls:
                 st.error(
                     "❌ Aucune vidéo trouvée sur cette page. "
-                    "Le site utilise peut-être du JavaScript pour charger les vidéos "
-                    "(rendu côté client). Dans ce cas, yt-dlp ne pourra pas les détecter "
-                    "via le scraping HTML. Consulte la section ⚙️ Options avancées."
+                    "Le site charge probablement ses vidéos en JavaScript. "
+                    "Inspecte le HTML de la page et ajuste le scraper si nécessaire."
                 )
             else:
                 st.success(f"✅ {len(all_video_urls)} vidéo(s) trouvée(s).")
@@ -368,7 +376,8 @@ with tab_multi:
                             )
                         else:
                             st.success(
-                                f"✅ {len(mp3_files)} fichiers MP3 prêts (sur {len(all_video_urls)} tentatives)."
+                                f"✅ {len(mp3_files)} fichiers MP3 prêts "
+                                f"(sur {len(all_video_urls)} tentatives)."
                             )
                             zip_bytes = create_zip(mp3_files)
                             st.download_button(
