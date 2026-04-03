@@ -1,5 +1,6 @@
 """
 Téléchargeur Audio — Interface Streamlit
+
 Dépendances : streamlit, yt-dlp, ffmpeg (système), requests, beautifulsoup4
 """
 
@@ -19,6 +20,7 @@ from bs4 import BeautifulSoup
 # ─────────────────────────────────────────────
 # Configuration de la page
 # ─────────────────────────────────────────────
+
 st.set_page_config(
     page_title="Téléchargeur Audio",
     page_icon="🎙️",
@@ -30,6 +32,14 @@ st.caption(
     "Télécharge l'audio d'une vidéo en MP3 — URL unique ou toutes les vidéos d'une page."
 )
 
+# ─────────────────────────────────────────────
+# Initialisation du session_state
+# ─────────────────────────────────────────────
+
+if "scraped_entries" not in st.session_state:
+    st.session_state.scraped_entries = []
+if "scrape_done" not in st.session_state:
+    st.session_state.scrape_done = False
 
 # ─────────────────────────────────────────────
 # Utilitaires
@@ -97,7 +107,9 @@ def download_single_audio(url: str, output_dir: str) -> tuple[bool, str, str]:
         return False, "", str(exc)
 
 
-def scrape_senat_videos(base_url: str, num_pages: int, session: requests.Session) -> list[tuple[str, str]]:
+def scrape_senat_videos(
+    base_url: str, num_pages: int, session: requests.Session
+) -> list[tuple[str, str]]:
     """
     Scrape spécifique pour videos.senat.fr.
     Utilise senat_videos_search.php pour récupérer les vidéos page par page.
@@ -105,12 +117,14 @@ def scrape_senat_videos(base_url: str, num_pages: int, session: requests.Session
     """
     results: list[tuple[str, str]] = []
 
-    # Extraire le paramètre commission de l'URL
-    commission_match = re.search(r'commission=([^&]+)', base_url)
+    commission_match = re.search(r"commission=([^&]+)", base_url)
     commission = commission_match.group(1) if commission_match else "DIST"
 
     for page in range(1, num_pages + 1):
-        search_url = f"https://videos.senat.fr/senat_videos_search.php?commission={commission}&page={page}"
+        search_url = (
+            f"https://videos.senat.fr/senat_videos_search.php"
+            f"?commission={commission}&page={page}"
+        )
         try:
             resp = session.get(search_url, timeout=20)
             resp.raise_for_status()
@@ -121,7 +135,7 @@ def scrape_senat_videos(base_url: str, num_pages: int, session: requests.Session
         soup = BeautifulSoup(resp.text, "html.parser")
 
         # Pattern : href="video.XXXXXXX_YYYYYYY.titre-de-la-video"
-        video_pattern = re.compile(r'^video\.\w+')
+        video_pattern = re.compile(r"^video\.")
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if video_pattern.match(href):
@@ -134,7 +148,9 @@ def scrape_senat_videos(base_url: str, num_pages: int, session: requests.Session
     return results
 
 
-def scrape_generic_videos(page_url: str, num_pages: int, session: requests.Session) -> list[tuple[str, str]]:
+def scrape_generic_videos(
+    page_url: str, num_pages: int, session: requests.Session
+) -> list[tuple[str, str]]:
     """
     Scraper générique pour les autres sites.
     """
@@ -164,7 +180,9 @@ def scrape_generic_videos(page_url: str, num_pages: int, session: requests.Sessi
                 add(src)
 
         # Liens vers fichiers vidéo
-        video_ext = re.compile(r"\.(mp4|webm|ogv|avi|mov|mkv|flv|m4v|ts)(\?.*)?$", re.IGNORECASE)
+        video_ext = re.compile(
+            r"\.(mp4|webm|ogv|avi|mov|mkv|flv|m4v|ts)(\?.*)?$", re.IGNORECASE
+        )
         for a in soup.find_all("a", href=True):
             if video_ext.search(a["href"]):
                 add(a["href"], a.get("title", ""))
@@ -183,18 +201,15 @@ def download_multiple(
 ) -> list[str]:
     mp3_files: list[str] = []
     total = len(entries)
-
     for idx, (url, title) in enumerate(entries, 1):
         label = title or url[:60]
         status_text.text(f"Téléchargement {idx}/{total} — {label}…")
         progress_bar.progress(idx / total)
-
         success, _, mp3_path = download_single_audio(url, output_dir)
         if success and mp3_path and os.path.isfile(mp3_path):
             mp3_files.append(mp3_path)
         else:
             st.warning(f"⚠️ Échec : {label}\n{mp3_path}")
-
     return mp3_files
 
 
@@ -213,8 +228,8 @@ def create_zip(mp3_files: list[str]) -> bytes:
 
 tab_single, tab_multi = st.tabs(["🔗 URL unique", "📄 Page complète"])
 
-
 # ── Onglet 1 : URL unique ──────────────────────────────────────────────────────
+
 with tab_single:
     st.subheader("Télécharger l'audio d'une vidéo")
     st.markdown(
@@ -234,7 +249,9 @@ with tab_single:
         else:
             with st.spinner("Extraction de l'audio en cours…"):
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    success, title, mp3_path = download_single_audio(url_input.strip(), tmpdir)
+                    success, title, mp3_path = download_single_audio(
+                        url_input.strip(), tmpdir
+                    )
                     if success and mp3_path and os.path.isfile(mp3_path):
                         with open(mp3_path, "rb") as f:
                             audio_bytes = f.read()
@@ -252,11 +269,10 @@ with tab_single:
                         if mp3_path:
                             st.code(mp3_path)
 
-
 # ── Onglet 2 : Page complète ───────────────────────────────────────────────────
+
 with tab_multi:
     st.subheader("Télécharger tous les audios d'une page")
-
     st.info(
         "🎙️ Supporte nativement **videos.senat.fr** — colle l'URL de la commission "
         "et indique le nombre de pages."
@@ -278,80 +294,100 @@ with tab_multi:
             step=1,
         )
 
-    if st.button("🔍 Analyser puis télécharger", key="btn_multi", type="primary"):
+    # ── Étape 1 : Analyser ────────────────────────────────────────────────────
+
+    if st.button("🔍 Analyser la page", key="btn_scrape", type="secondary"):
         if not page_url_input.strip():
             st.error("Saisis une URL valide.")
         else:
+            # Réinitialiser les résultats précédents
+            st.session_state.scraped_entries = []
+            st.session_state.scrape_done = False
+
             session = requests.Session()
-            session.headers.update({
-                "User-Agent": "Mozilla/5.0 (compatible; AudioDownloader/1.0)"
-            })
+            session.headers.update(
+                {"User-Agent": "Mozilla/5.0 (compatible; AudioDownloader/1.0)"}
+            )
 
-            scrape_status = st.empty()
-            scrape_status.text("Scraping en cours…")
+            with st.spinner("Scraping en cours…"):
+                is_senat = "videos.senat.fr" in page_url_input
+                if is_senat:
+                    entries = scrape_senat_videos(
+                        page_url_input.strip(), int(num_pages), session
+                    )
+                else:
+                    entries = scrape_generic_videos(
+                        page_url_input.strip(), int(num_pages), session
+                    )
 
-            # Détection automatique du site Sénat
-            is_senat = "videos.senat.fr" in page_url_input
+            # ✅ Stocker dans session_state — survit au prochain rerun
+            st.session_state.scraped_entries = entries
+            st.session_state.scrape_done = True
 
-            if is_senat:
-                entries = scrape_senat_videos(page_url_input.strip(), int(num_pages), session)
-            else:
-                entries = scrape_generic_videos(page_url_input.strip(), int(num_pages), session)
+    # ── Étape 2 : Afficher les résultats et proposer le téléchargement ────────
 
-            scrape_status.empty()
+    if st.session_state.scrape_done:
+        entries = st.session_state.scraped_entries
 
-            if not entries:
-                st.error("❌ Aucune vidéo trouvée.")
-            else:
-                st.success(f"✅ {len(entries)} vidéo(s) trouvée(s).")
+        if not entries:
+            st.error("❌ Aucune vidéo trouvée sur cette page.")
+        else:
+            st.success(f"✅ {len(entries)} vidéo(s) trouvée(s).")
 
-                with st.expander(f"📋 Liste des vidéos ({len(entries)})"):
-                    for url, title in entries:
-                        st.markdown(f"- **{title}** — `{url}`")
+            with st.expander(f"📋 Liste des vidéos ({len(entries)})"):
+                for url, title in entries:
+                    st.markdown(f"- **{title}** — `{url}`")
 
-                if st.button(
-                    f"⬇️ Télécharger les {len(entries)} audio(s)",
-                    key="btn_download_all",
-                ):
-                    dl_progress = st.progress(0)
-                    dl_status = st.empty()
+            # ── Étape 3 : Télécharger ─────────────────────────────────────────
+            # Ce bouton est en dehors du bloc du premier bouton :
+            # il s'affiche à chaque rerun tant que scrape_done est True.
 
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        mp3_files = download_multiple(entries, tmpdir, dl_progress, dl_status)
-                        dl_progress.empty()
-                        dl_status.empty()
+            if st.button(
+                f"⬇️ Télécharger les {len(entries)} audio(s)",
+                key="btn_download_all",
+                type="primary",
+            ):
+                dl_progress = st.progress(0)
+                dl_status = st.empty()
 
-                        if not mp3_files:
-                            st.error("❌ Aucun fichier MP3 créé.")
-                        elif len(mp3_files) == 1:
-                            with open(mp3_files[0], "rb") as f:
-                                data = f.read()
-                            st.success("✅ 1 fichier MP3 prêt.")
-                            st.download_button(
-                                label="💾 Télécharger le MP3",
-                                data=data,
-                                file_name=os.path.basename(mp3_files[0]),
-                                mime="audio/mpeg",
-                                type="primary",
-                            )
-                        else:
-                            st.success(
-                                f"✅ {len(mp3_files)} fichiers MP3 prêts "
-                                f"(sur {len(entries)} tentatives)."
-                            )
-                            zip_bytes = create_zip(mp3_files)
-                            st.download_button(
-                                label=f"📦 Télécharger l'archive ZIP ({len(mp3_files)} MP3)",
-                                data=zip_bytes,
-                                file_name="audios_senat.zip",
-                                mime="application/zip",
-                                type="primary",
-                            )
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    mp3_files = download_multiple(
+                        entries, tmpdir, dl_progress, dl_status
+                    )
+                    dl_progress.empty()
+                    dl_status.empty()
 
+                    if not mp3_files:
+                        st.error("❌ Aucun fichier MP3 créé.")
+                    elif len(mp3_files) == 1:
+                        with open(mp3_files[0], "rb") as f:
+                            data = f.read()
+                        st.success("✅ 1 fichier MP3 prêt.")
+                        st.download_button(
+                            label="💾 Télécharger le MP3",
+                            data=data,
+                            file_name=os.path.basename(mp3_files[0]),
+                            mime="audio/mpeg",
+                            type="primary",
+                        )
+                    else:
+                        st.success(
+                            f"✅ {len(mp3_files)} fichiers MP3 prêts "
+                            f"(sur {len(entries)} tentatives)."
+                        )
+                        zip_bytes = create_zip(mp3_files)
+                        st.download_button(
+                            label=f"📦 Télécharger l'archive ZIP ({len(mp3_files)} MP3)",
+                            data=zip_bytes,
+                            file_name="audios_senat.zip",
+                            mime="application/zip",
+                            type="primary",
+                        )
 
 # ─────────────────────────────────────────────
 # Pied de page
 # ─────────────────────────────────────────────
+
 st.divider()
 st.caption(
     "Powered by [yt-dlp](https://github.com/yt-dlp/yt-dlp) · "
