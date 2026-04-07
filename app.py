@@ -2,6 +2,7 @@
 Téléchargeur Audio — Interface Streamlit
 
 Dépendances : streamlit, yt-dlp, ffmpeg (système), requests, beautifulsoup4
+packages.txt (Streamlit Cloud) : ffmpeg
 """
 
 import io
@@ -35,6 +36,9 @@ st.caption(
 # ─────────────────────────────────────────────
 # Utilitaires
 # ─────────────────────────────────────────────
+
+BATCH_SIZE = 5  # Nombre de fichiers traités par lot (évite le crash serveur)
+
 
 def find_ffmpeg() -> str | None:
     found = shutil.which("ffmpeg")
@@ -86,12 +90,12 @@ def download_single_audio(url: str, output_dir: str) -> tuple[bool, str, str]:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if info is None:
-                return False, "", "yt-dlp n'a pas pu extraire d'informations."
+                return False, "", "yt-dlp : aucune information extraite."
             title = info.get("title", "audio_sans_titre")
             for f in os.listdir(output_dir):
                 if f.endswith(".mp3"):
                     return True, title, os.path.join(output_dir, f)
-            return False, title, "Fichier MP3 non créé — ffmpeg a peut-être échoué."
+            return False, title, "MP3 non créé — ffmpeg a peut-être échoué."
     except Exception as exc:
         return False, "", str(exc)
 
@@ -170,6 +174,15 @@ def scrape_generic_videos(
     return results
 
 
+def build_zip(mp3_data: list[tuple[str, bytes]]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname, fbytes in mp3_data:
+            zf.writestr(fname, fbytes)
+    buf.seek(0)
+    return buf.read()
+
+
 # ─────────────────────────────────────────────
 # Interface — onglets
 # ─────────────────────────────────────────────
@@ -223,7 +236,7 @@ with tab_single:
                     type="primary",
                 )
             else:
-                st.error(f"❌ Échec du téléchargement : {error_msg}")
+                st.error(f"❌ Échec : {error_msg}")
 
 # ── Onglet 2 : Page complète ───────────────────────────────────────────────────
 
@@ -252,8 +265,9 @@ with tab_multi:
         if not page_url_input.strip():
             st.error("Saisis une URL valide.")
         else:
-            st.session_state.pop("entries", None)
-            st.session_state.pop("download_result", None)
+            # Réinitialisation complète
+            for key in ("entries", "batch_index", "mp3_data", "dl_logs"):
+                st.session_state.pop(key, None)
 
             session = requests.Session()
             session.headers.update(
@@ -262,130 +276,125 @@ with tab_multi:
 
             with st.spinner("Scraping en cours…"):
                 is_senat = "videos.senat.fr" in page_url_input
-                if is_senat:
-                    entries = scrape_senat_videos(
-                        page_url_input.strip(), int(num_pages), session
-                    )
-                else:
-                    entries = scrape_generic_videos(
-                        page_url_input.strip(), int(num_pages), session
-                    )
+                entries = (
+                    scrape_senat_videos(page_url_input.strip(), int(num_pages), session)
+                    if is_senat
+                    else scrape_generic_videos(page_url_input.strip(), int(num_pages), session)
+                )
 
             st.session_state["entries"] = entries
+            st.session_state["batch_index"] = 0
+            st.session_state["mp3_data"] = []   # list[tuple[str, bytes]]
+            st.session_state["dl_logs"] = []
 
-    # ── Étape 2 : Affichage de la liste (persiste entre reruns) ─────────────
+    # ── Étape 2 : Affichage de la liste ──────────────────────────────────────
 
-    entries = st.session_state.get("entries")
+    entries: list | None = st.session_state.get("entries")
 
     if entries is not None:
         if not entries:
             st.error("❌ Aucune vidéo trouvée.")
         else:
-            st.success(f"✅ {len(entries)} vidéo(s) trouvée(s).")
+            batch_index: int = st.session_state.get("batch_index", 0)
+            mp3_data: list = st.session_state.get("mp3_data", [])
+            total = len(entries)
+            done = batch_index >= total
 
-            with st.expander(f"📋 Liste des vidéos ({len(entries)})"):
+            # Barre de progression globale
+            if batch_index > 0:
+                st.progress(min(batch_index / total, 1.0))
+                st.caption(
+                    f"**{len(mp3_data)} MP3 récupérés** sur {batch_index} tentées "
+                    f"({total - batch_index} restantes)"
+                    if not done
+                    else f"**Terminé — {len(mp3_data)} MP3** sur {total} tentatives."
+                )
+
+            with st.expander(f"📋 Liste des vidéos ({total})", expanded=(batch_index == 0)):
                 for url, title in entries:
                     st.markdown(f"- **{title}** — `{url}`")
 
-            # ── Étape 3 : Téléchargement ─────────────────────────────────────
+            # ── Bouton de lancement / continuation ───────────────────────────
 
-            if st.button(
-                f"⬇️ Télécharger les {len(entries)} audio(s)",
-                key="btn_download_all",
-            ):
-                st.session_state.pop("download_result", None)
+            if not done:
+                remaining = total - batch_index
+                label = (
+                    f"⬇️ Démarrer le téléchargement ({total} audios, par lots de {BATCH_SIZE})"
+                    if batch_index == 0
+                    else f"▶️ Continuer — lot suivant ({remaining} restants)"
+                )
 
-                dl_progress = st.progress(0)
-                dl_status = st.empty()
-                log_placeholder = st.empty()
-                logs: list[str] = []
-                # Stockage (nom_fichier, octets) en mémoire — pas de tmpdir inter-runs
-                mp3_data: list[tuple[str, bytes]] = []
-                total = len(entries)
+                if st.button(label, key="btn_batch", type="primary"):
+                    batch_end = min(batch_index + BATCH_SIZE, total)
+                    batch = entries[batch_index:batch_end]
 
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    for idx, (url, title) in enumerate(entries, 1):
-                        label = title or url[:60]
-                        dl_status.text(f"⏳ {idx}/{total} — {label[:70]}…")
-                        dl_progress.progress(idx / total)
+                    dl_progress = st.progress(0)
+                    dl_status = st.empty()
+                    logs: list = st.session_state["dl_logs"]
 
-                        success, _, mp3_path = download_single_audio(url, tmpdir)
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        for i, (url, title) in enumerate(batch, 1):
+                            label_short = (title or url)[:70]
+                            dl_status.text(
+                                f"⏳ {batch_index + i}/{total} — {label_short}…"
+                            )
+                            dl_progress.progress(i / len(batch))
 
-                        if success and mp3_path and os.path.isfile(mp3_path):
-                            with open(mp3_path, "rb") as f:
-                                mp3_data.append((os.path.basename(mp3_path), f.read()))
-                            logs.append(f"✅ {idx}/{total} — {label[:60]}")
-                        else:
-                            logs.append(f"❌ {idx}/{total} — {label[:60]} → {mp3_path}")
+                            success, _, mp3_path = download_single_audio(url, tmpdir)
 
-                        # Affiche les 10 dernières lignes de log en temps réel
-                        log_placeholder.text("\n".join(logs[-10:]))
+                            if success and mp3_path and os.path.isfile(mp3_path):
+                                with open(mp3_path, "rb") as f:
+                                    st.session_state["mp3_data"].append(
+                                        (os.path.basename(mp3_path), f.read())
+                                    )
+                                logs.append(f"✅ {batch_index + i}/{total} — {label_short}")
+                            else:
+                                logs.append(
+                                    f"❌ {batch_index + i}/{total} — {label_short} → {mp3_path}"
+                                )
 
-                dl_progress.empty()
-                dl_status.empty()
-                log_placeholder.empty()
+                    dl_progress.empty()
+                    dl_status.empty()
+                    st.session_state["batch_index"] = batch_end
+                    st.session_state["dl_logs"] = logs
+                    st.rerun()
 
-                if not mp3_data:
-                    st.error(
-                        "❌ Aucun fichier MP3 créé. "
-                        "Vérifiez que ffmpeg est bien installé (voir message en haut) "
-                        "et que les URLs sont accessibles depuis ce serveur."
-                    )
-                    with st.expander("📋 Journal complet des erreurs"):
+            # ── Téléchargement final (ZIP) dès qu'il y a des fichiers ─────────
+
+            mp3_data = st.session_state.get("mp3_data", [])
+
+            if mp3_data:
+                st.divider()
+
+                # Journal des erreurs éventuelles
+                logs = st.session_state.get("dl_logs", [])
+                errors = [l for l in logs if l.startswith("❌")]
+                if errors:
+                    with st.expander(f"⚠️ {len(errors)} échec(s) — voir le journal"):
                         st.text("\n".join(logs))
+
+                if done:
+                    st.success(f"✅ Tous les lots traités — **{len(mp3_data)} MP3** prêts.")
                 else:
-                    if len(mp3_data) == 1:
-                        st.session_state["download_result"] = {
-                            "type": "single",
-                            "data": mp3_data[0][1],
-                            "filename": mp3_data[0][0],
-                            "count": 1,
-                            "total": total,
-                            "logs": logs,
-                        }
-                    else:
-                        buf = io.BytesIO()
-                        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                            for fname, fbytes in mp3_data:
-                                zf.writestr(fname, fbytes)
-                        buf.seek(0)
-                        st.session_state["download_result"] = {
-                            "type": "zip",
-                            "data": buf.read(),
-                            "filename": "audios_senat.zip",
-                            "count": len(mp3_data),
-                            "total": total,
-                            "logs": logs,
-                        }
+                    st.info(
+                        f"💡 **{len(mp3_data)} MP3 déjà disponibles.** "
+                        "Tu peux les télécharger maintenant ou continuer pour en récupérer plus."
+                    )
 
-            # ── Étape 4 : Bouton de téléchargement final ─────────────────────
-
-            result = st.session_state.get("download_result")
-            if result:
-                nb_echecs = result["total"] - result["count"]
-                if nb_echecs > 0:
-                    st.warning(f"⚠️ {nb_echecs} fichier(s) n'ont pas pu être téléchargés.")
-                    with st.expander("📋 Voir le journal"):
-                        st.text("\n".join(result.get("logs", [])))
-
-                if result["type"] == "single":
-                    st.success("✅ 1 fichier MP3 prêt.")
+                if len(mp3_data) == 1:
                     st.download_button(
                         label="💾 Télécharger le MP3",
-                        data=result["data"],
-                        file_name=result["filename"],
+                        data=mp3_data[0][1],
+                        file_name=mp3_data[0][0],
                         mime="audio/mpeg",
                         type="primary",
                     )
-                elif result["type"] == "zip":
-                    st.success(
-                        f"✅ {result['count']} fichiers MP3 prêts "
-                        f"(sur {result['total']} tentatives)."
-                    )
+                else:
+                    zip_bytes = build_zip(mp3_data)
                     st.download_button(
-                        label=f"📦 Télécharger l'archive ZIP ({result['count']} MP3)",
-                        data=result["data"],
-                        file_name=result["filename"],
+                        label=f"📦 Télécharger l'archive ZIP ({len(mp3_data)} MP3)",
+                        data=zip_bytes,
+                        file_name="audios_senat.zip",
                         mime="application/zip",
                         type="primary",
                     )
