@@ -40,12 +40,9 @@ def find_ffmpeg() -> str | None:
     found = shutil.which("ffmpeg")
     if found:
         return os.path.dirname(found)
-    if os.path.exists("/opt/homebrew/bin/ffmpeg"):
-        return "/opt/homebrew/bin"
-    if os.path.exists("/usr/local/bin/ffmpeg"):
-        return "/usr/local/bin"
-    if os.path.exists("/usr/bin/ffmpeg"):
-        return "/usr/bin"
+    for path in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"):
+        if os.path.exists(os.path.join(path, "ffmpeg")):
+            return path
     return None
 
 
@@ -56,7 +53,8 @@ if FFMPEG_LOCATION:
 else:
     st.error(
         "❌ ffmpeg introuvable. "
-        "Installe-le : `brew install ffmpeg` (Mac) ou `apt install ffmpeg` (Linux)."
+        "Sur Streamlit Cloud : ajoute `ffmpeg` dans un fichier `packages.txt` à la racine du repo. "
+        "En local : `brew install ffmpeg` (Mac) ou `apt install ffmpeg` (Linux)."
     )
 
 
@@ -88,12 +86,12 @@ def download_single_audio(url: str, output_dir: str) -> tuple[bool, str, str]:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if info is None:
-                return False, "", "yt-dlp n'a pas pu extraire d'informations pour cette URL."
+                return False, "", "yt-dlp n'a pas pu extraire d'informations."
             title = info.get("title", "audio_sans_titre")
             for f in os.listdir(output_dir):
                 if f.endswith(".mp3"):
                     return True, title, os.path.join(output_dir, f)
-            return False, title, "Le fichier MP3 n'a pas été créé — ffmpeg a peut-être échoué."
+            return False, title, "Fichier MP3 non créé — ffmpeg a peut-être échoué."
     except Exception as exc:
         return False, "", str(exc)
 
@@ -101,13 +99,7 @@ def download_single_audio(url: str, output_dir: str) -> tuple[bool, str, str]:
 def scrape_senat_videos(
     base_url: str, num_pages: int, session: requests.Session
 ) -> list[tuple[str, str]]:
-    """
-    Scrape spécifique pour videos.senat.fr.
-    Utilise senat_videos_search.php pour récupérer les vidéos page par page.
-    Retourne une liste de (url_video, titre).
-    """
     results: list[tuple[str, str]] = []
-
     commission_match = re.search(r"commission=([^&]+)", base_url)
     commission = commission_match.group(1) if commission_match else "DIST"
 
@@ -124,7 +116,6 @@ def scrape_senat_videos(
             continue
 
         soup = BeautifulSoup(resp.text, "html.parser")
-
         video_pattern = re.compile(r"^video\.\w+")
         for a in soup.find_all("a", href=True):
             href = a["href"]
@@ -134,16 +125,12 @@ def scrape_senat_videos(
                 entry = (full_url, title)
                 if entry not in results:
                     results.append(entry)
-
     return results
 
 
 def scrape_generic_videos(
     page_url: str, num_pages: int, session: requests.Session
 ) -> list[tuple[str, str]]:
-    """
-    Scraper générique pour les autres sites.
-    """
     results: list[tuple[str, str]] = []
     separator = "&" if "?" in page_url else "?"
 
@@ -183,38 +170,6 @@ def scrape_generic_videos(
     return results
 
 
-def download_multiple(
-    entries: list[tuple[str, str]],
-    output_dir: str,
-    progress_bar,
-    status_text,
-) -> list[str]:
-    mp3_files: list[str] = []
-    total = len(entries)
-
-    for idx, (url, title) in enumerate(entries, 1):
-        label = title or url[:60]
-        status_text.text(f"Téléchargement {idx}/{total} — {label}…")
-        progress_bar.progress(idx / total)
-
-        success, _, mp3_path = download_single_audio(url, output_dir)
-        if success and mp3_path and os.path.isfile(mp3_path):
-            mp3_files.append(mp3_path)
-        else:
-            st.warning(f"⚠️ Échec : {label}\n{mp3_path}")
-
-    return mp3_files
-
-
-def create_zip(mp3_files: list[str]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in mp3_files:
-            zf.write(f, os.path.basename(f))
-    buf.seek(0)
-    return buf.read()
-
-
 # ─────────────────────────────────────────────
 # Interface — onglets
 # ─────────────────────────────────────────────
@@ -240,27 +195,35 @@ with tab_single:
         if not url_input.strip():
             st.error("Saisis une URL valide.")
         else:
+            audio_bytes = None
+            mp3_filename = "audio.mp3"
+            title = ""
+            error_msg = ""
+
             with st.spinner("Extraction de l'audio en cours…"):
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    success, title, mp3_path = download_single_audio(url_input.strip(), tmpdir)
+                    success, title, mp3_path = download_single_audio(
+                        url_input.strip(), tmpdir
+                    )
                     if success and mp3_path and os.path.isfile(mp3_path):
                         with open(mp3_path, "rb") as f:
                             audio_bytes = f.read()
+                        mp3_filename = os.path.basename(mp3_path)
+                    else:
+                        error_msg = mp3_path
 
-            if success and audio_bytes:
+            if audio_bytes:
                 st.success(f"✅ Audio extrait : **{title}**")
                 st.audio(audio_bytes, format="audio/mp3")
                 st.download_button(
                     label="💾 Télécharger le MP3",
                     data=audio_bytes,
-                    file_name=os.path.basename(mp3_path),
+                    file_name=mp3_filename,
                     mime="audio/mpeg",
                     type="primary",
                 )
             else:
-                st.error("❌ Échec du téléchargement.")
-                if mp3_path:
-                    st.code(mp3_path)
+                st.error(f"❌ Échec du téléchargement : {error_msg}")
 
 # ── Onglet 2 : Page complète ───────────────────────────────────────────────────
 
@@ -283,11 +246,12 @@ with tab_multi:
             "Nb de pages", min_value=1, max_value=50, value=7, step=1,
         )
 
+    # ── Étape 1 : Analyse ────────────────────────────────────────────────────
+
     if st.button("🔍 Analyser la page", key="btn_multi", type="primary"):
         if not page_url_input.strip():
             st.error("Saisis une URL valide.")
         else:
-            # Réinitialise les résultats d'une éventuelle recherche précédente
             st.session_state.pop("entries", None)
             st.session_state.pop("download_result", None)
 
@@ -307,9 +271,9 @@ with tab_multi:
                         page_url_input.strip(), int(num_pages), session
                     )
 
-            st.session_state["entries"] = entries  # liste vide ou remplie
+            st.session_state["entries"] = entries
 
-    # ── Affichage des résultats — HORS du bloc bouton pour survivre aux reruns ──
+    # ── Étape 2 : Affichage de la liste (persiste entre reruns) ─────────────
 
     entries = st.session_state.get("entries")
 
@@ -323,50 +287,88 @@ with tab_multi:
                 for url, title in entries:
                     st.markdown(f"- **{title}** — `{url}`")
 
+            # ── Étape 3 : Téléchargement ─────────────────────────────────────
+
             if st.button(
                 f"⬇️ Télécharger les {len(entries)} audio(s)",
                 key="btn_download_all",
             ):
+                st.session_state.pop("download_result", None)
+
                 dl_progress = st.progress(0)
                 dl_status = st.empty()
+                log_placeholder = st.empty()
+                logs: list[str] = []
+                # Stockage (nom_fichier, octets) en mémoire — pas de tmpdir inter-runs
+                mp3_data: list[tuple[str, bytes]] = []
+                total = len(entries)
 
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    mp3_files = download_multiple(
-                        entries, tmpdir, dl_progress, dl_status
-                    )
-                    # Lire les données EN MÉMOIRE avant fermeture du tmpdir
-                    if len(mp3_files) == 1:
-                        with open(mp3_files[0], "rb") as f:
-                            file_data = f.read()
-                        st.session_state["download_result"] = {
-                            "type": "single",
-                            "data": file_data,
-                            "filename": os.path.basename(mp3_files[0]),
-                            "count": 1,
-                            "total": len(entries),
-                        }
-                    elif len(mp3_files) > 1:
-                        zip_data = create_zip(mp3_files)
-                        st.session_state["download_result"] = {
-                            "type": "zip",
-                            "data": zip_data,
-                            "filename": "audios_senat.zip",
-                            "count": len(mp3_files),
-                            "total": len(entries),
-                        }
-                    else:
-                        st.session_state["download_result"] = {"type": "error"}
+                    for idx, (url, title) in enumerate(entries, 1):
+                        label = title or url[:60]
+                        dl_status.text(f"⏳ {idx}/{total} — {label[:70]}…")
+                        dl_progress.progress(idx / total)
+
+                        success, _, mp3_path = download_single_audio(url, tmpdir)
+
+                        if success and mp3_path and os.path.isfile(mp3_path):
+                            with open(mp3_path, "rb") as f:
+                                mp3_data.append((os.path.basename(mp3_path), f.read()))
+                            logs.append(f"✅ {idx}/{total} — {label[:60]}")
+                        else:
+                            logs.append(f"❌ {idx}/{total} — {label[:60]} → {mp3_path}")
+
+                        # Affiche les 10 dernières lignes de log en temps réel
+                        log_placeholder.text("\n".join(logs[-10:]))
 
                 dl_progress.empty()
                 dl_status.empty()
-                st.rerun()
+                log_placeholder.empty()
 
-            # ── Bouton de téléchargement final (persisté via session_state) ────
+                if not mp3_data:
+                    st.error(
+                        "❌ Aucun fichier MP3 créé. "
+                        "Vérifiez que ffmpeg est bien installé (voir message en haut) "
+                        "et que les URLs sont accessibles depuis ce serveur."
+                    )
+                    with st.expander("📋 Journal complet des erreurs"):
+                        st.text("\n".join(logs))
+                else:
+                    if len(mp3_data) == 1:
+                        st.session_state["download_result"] = {
+                            "type": "single",
+                            "data": mp3_data[0][1],
+                            "filename": mp3_data[0][0],
+                            "count": 1,
+                            "total": total,
+                            "logs": logs,
+                        }
+                    else:
+                        buf = io.BytesIO()
+                        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                            for fname, fbytes in mp3_data:
+                                zf.writestr(fname, fbytes)
+                        buf.seek(0)
+                        st.session_state["download_result"] = {
+                            "type": "zip",
+                            "data": buf.read(),
+                            "filename": "audios_senat.zip",
+                            "count": len(mp3_data),
+                            "total": total,
+                            "logs": logs,
+                        }
+
+            # ── Étape 4 : Bouton de téléchargement final ─────────────────────
+
             result = st.session_state.get("download_result")
             if result:
-                if result["type"] == "error":
-                    st.error("❌ Aucun fichier MP3 créé.")
-                elif result["type"] == "single":
+                nb_echecs = result["total"] - result["count"]
+                if nb_echecs > 0:
+                    st.warning(f"⚠️ {nb_echecs} fichier(s) n'ont pas pu être téléchargés.")
+                    with st.expander("📋 Voir le journal"):
+                        st.text("\n".join(result.get("logs", [])))
+
+                if result["type"] == "single":
                     st.success("✅ 1 fichier MP3 prêt.")
                     st.download_button(
                         label="💾 Télécharger le MP3",
