@@ -33,15 +33,6 @@ st.caption(
 )
 
 # ─────────────────────────────────────────────
-# Initialisation du session_state
-# ─────────────────────────────────────────────
-
-if "scraped_entries" not in st.session_state:
-    st.session_state.scraped_entries = []
-if "scrape_done" not in st.session_state:
-    st.session_state.scrape_done = False
-
-# ─────────────────────────────────────────────
 # Utilitaires
 # ─────────────────────────────────────────────
 
@@ -134,8 +125,7 @@ def scrape_senat_videos(
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Pattern : href="video.XXXXXXX_YYYYYYY.titre-de-la-video"
-        video_pattern = re.compile(r"^video\.")
+        video_pattern = re.compile(r"^video\.\w+")
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if video_pattern.match(href):
@@ -173,13 +163,11 @@ def scrape_generic_videos(
             if (full, title) not in results:
                 results.append((full, title))
 
-        # Balises vidéo HTML5
         for tag in soup.find_all(["video", "source"]):
             src = tag.get("src") or tag.get("data-src")
             if src:
                 add(src)
 
-        # Liens vers fichiers vidéo
         video_ext = re.compile(
             r"\.(mp4|webm|ogv|avi|mov|mkv|flv|m4v|ts)(\?.*)?$", re.IGNORECASE
         )
@@ -187,7 +175,6 @@ def scrape_generic_videos(
             if video_ext.search(a["href"]):
                 add(a["href"], a.get("title", ""))
 
-        # iframes
         for iframe in soup.find_all("iframe", src=True):
             src = iframe["src"]
             if any(kw in src for kw in ["video", "player", "embed", "youtube", "vimeo"]):
@@ -197,19 +184,25 @@ def scrape_generic_videos(
 
 
 def download_multiple(
-    entries: list[tuple[str, str]], output_dir: str, progress_bar, status_text
+    entries: list[tuple[str, str]],
+    output_dir: str,
+    progress_bar,
+    status_text,
 ) -> list[str]:
     mp3_files: list[str] = []
     total = len(entries)
+
     for idx, (url, title) in enumerate(entries, 1):
         label = title or url[:60]
         status_text.text(f"Téléchargement {idx}/{total} — {label}…")
         progress_bar.progress(idx / total)
+
         success, _, mp3_path = download_single_audio(url, output_dir)
         if success and mp3_path and os.path.isfile(mp3_path):
             mp3_files.append(mp3_path)
         else:
             st.warning(f"⚠️ Échec : {label}\n{mp3_path}")
+
     return mp3_files
 
 
@@ -249,25 +242,25 @@ with tab_single:
         else:
             with st.spinner("Extraction de l'audio en cours…"):
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    success, title, mp3_path = download_single_audio(
-                        url_input.strip(), tmpdir
-                    )
+                    success, title, mp3_path = download_single_audio(url_input.strip(), tmpdir)
                     if success and mp3_path and os.path.isfile(mp3_path):
                         with open(mp3_path, "rb") as f:
                             audio_bytes = f.read()
-                        st.success(f"✅ Audio extrait : **{title}**")
-                        st.audio(audio_bytes, format="audio/mp3")
-                        st.download_button(
-                            label="💾 Télécharger le MP3",
-                            data=audio_bytes,
-                            file_name=os.path.basename(mp3_path),
-                            mime="audio/mpeg",
-                            type="primary",
-                        )
-                    else:
-                        st.error("❌ Échec du téléchargement.")
-                        if mp3_path:
-                            st.code(mp3_path)
+
+            if success and audio_bytes:
+                st.success(f"✅ Audio extrait : **{title}**")
+                st.audio(audio_bytes, format="audio/mp3")
+                st.download_button(
+                    label="💾 Télécharger le MP3",
+                    data=audio_bytes,
+                    file_name=os.path.basename(mp3_path),
+                    mime="audio/mpeg",
+                    type="primary",
+                )
+            else:
+                st.error("❌ Échec du téléchargement.")
+                if mp3_path:
+                    st.code(mp3_path)
 
 # ── Onglet 2 : Page complète ───────────────────────────────────────────────────
 
@@ -287,22 +280,16 @@ with tab_multi:
         )
     with col2:
         num_pages = st.number_input(
-            "Nb de pages",
-            min_value=1,
-            max_value=50,
-            value=7,
-            step=1,
+            "Nb de pages", min_value=1, max_value=50, value=7, step=1,
         )
 
-    # ── Étape 1 : Analyser ────────────────────────────────────────────────────
-
-    if st.button("🔍 Analyser la page", key="btn_scrape", type="secondary"):
+    if st.button("🔍 Analyser la page", key="btn_multi", type="primary"):
         if not page_url_input.strip():
             st.error("Saisis une URL valide.")
         else:
-            # Réinitialiser les résultats précédents
-            st.session_state.scraped_entries = []
-            st.session_state.scrape_done = False
+            # Réinitialise les résultats d'une éventuelle recherche précédente
+            st.session_state.pop("entries", None)
+            st.session_state.pop("download_result", None)
 
             session = requests.Session()
             session.headers.update(
@@ -320,17 +307,15 @@ with tab_multi:
                         page_url_input.strip(), int(num_pages), session
                     )
 
-            # ✅ Stocker dans session_state — survit au prochain rerun
-            st.session_state.scraped_entries = entries
-            st.session_state.scrape_done = True
+            st.session_state["entries"] = entries  # liste vide ou remplie
 
-    # ── Étape 2 : Afficher les résultats et proposer le téléchargement ────────
+    # ── Affichage des résultats — HORS du bloc bouton pour survivre aux reruns ──
 
-    if st.session_state.scrape_done:
-        entries = st.session_state.scraped_entries
+    entries = st.session_state.get("entries")
 
+    if entries is not None:
         if not entries:
-            st.error("❌ Aucune vidéo trouvée sur cette page.")
+            st.error("❌ Aucune vidéo trouvée.")
         else:
             st.success(f"✅ {len(entries)} vidéo(s) trouvée(s).")
 
@@ -338,14 +323,9 @@ with tab_multi:
                 for url, title in entries:
                     st.markdown(f"- **{title}** — `{url}`")
 
-            # ── Étape 3 : Télécharger ─────────────────────────────────────────
-            # Ce bouton est en dehors du bloc du premier bouton :
-            # il s'affiche à chaque rerun tant que scrape_done est True.
-
             if st.button(
                 f"⬇️ Télécharger les {len(entries)} audio(s)",
                 key="btn_download_all",
-                type="primary",
             ):
                 dl_progress = st.progress(0)
                 dl_status = st.empty()
@@ -354,35 +334,59 @@ with tab_multi:
                     mp3_files = download_multiple(
                         entries, tmpdir, dl_progress, dl_status
                     )
-                    dl_progress.empty()
-                    dl_status.empty()
-
-                    if not mp3_files:
-                        st.error("❌ Aucun fichier MP3 créé.")
-                    elif len(mp3_files) == 1:
+                    # Lire les données EN MÉMOIRE avant fermeture du tmpdir
+                    if len(mp3_files) == 1:
                         with open(mp3_files[0], "rb") as f:
-                            data = f.read()
-                        st.success("✅ 1 fichier MP3 prêt.")
-                        st.download_button(
-                            label="💾 Télécharger le MP3",
-                            data=data,
-                            file_name=os.path.basename(mp3_files[0]),
-                            mime="audio/mpeg",
-                            type="primary",
-                        )
+                            file_data = f.read()
+                        st.session_state["download_result"] = {
+                            "type": "single",
+                            "data": file_data,
+                            "filename": os.path.basename(mp3_files[0]),
+                            "count": 1,
+                            "total": len(entries),
+                        }
+                    elif len(mp3_files) > 1:
+                        zip_data = create_zip(mp3_files)
+                        st.session_state["download_result"] = {
+                            "type": "zip",
+                            "data": zip_data,
+                            "filename": "audios_senat.zip",
+                            "count": len(mp3_files),
+                            "total": len(entries),
+                        }
                     else:
-                        st.success(
-                            f"✅ {len(mp3_files)} fichiers MP3 prêts "
-                            f"(sur {len(entries)} tentatives)."
-                        )
-                        zip_bytes = create_zip(mp3_files)
-                        st.download_button(
-                            label=f"📦 Télécharger l'archive ZIP ({len(mp3_files)} MP3)",
-                            data=zip_bytes,
-                            file_name="audios_senat.zip",
-                            mime="application/zip",
-                            type="primary",
-                        )
+                        st.session_state["download_result"] = {"type": "error"}
+
+                dl_progress.empty()
+                dl_status.empty()
+                st.rerun()
+
+            # ── Bouton de téléchargement final (persisté via session_state) ────
+            result = st.session_state.get("download_result")
+            if result:
+                if result["type"] == "error":
+                    st.error("❌ Aucun fichier MP3 créé.")
+                elif result["type"] == "single":
+                    st.success("✅ 1 fichier MP3 prêt.")
+                    st.download_button(
+                        label="💾 Télécharger le MP3",
+                        data=result["data"],
+                        file_name=result["filename"],
+                        mime="audio/mpeg",
+                        type="primary",
+                    )
+                elif result["type"] == "zip":
+                    st.success(
+                        f"✅ {result['count']} fichiers MP3 prêts "
+                        f"(sur {result['total']} tentatives)."
+                    )
+                    st.download_button(
+                        label=f"📦 Télécharger l'archive ZIP ({result['count']} MP3)",
+                        data=result["data"],
+                        file_name=result["filename"],
+                        mime="application/zip",
+                        type="primary",
+                    )
 
 # ─────────────────────────────────────────────
 # Pied de page
