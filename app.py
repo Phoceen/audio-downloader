@@ -5,12 +5,10 @@ Dépendances : streamlit, yt-dlp, ffmpeg (système), requests, beautifulsoup4
 packages.txt (Streamlit Cloud) : ffmpeg
 """
 
-import io
 import os
 import re
 import shutil
 import tempfile
-import zipfile
 from urllib.parse import urljoin
 
 import requests
@@ -36,9 +34,6 @@ st.caption(
 # ─────────────────────────────────────────────
 # Utilitaires
 # ─────────────────────────────────────────────
-
-BATCH_SIZE = 5  # Nombre de fichiers traités par lot (évite le crash serveur)
-
 
 def find_ffmpeg() -> str | None:
     found = shutil.which("ffmpeg")
@@ -75,7 +70,7 @@ def get_ydl_opts(output_dir: str) -> dict:
         "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
-        "ignoreerrors": True,
+        "ignoreerrors": False,
         "noplaylist": False,
     }
     if FFMPEG_LOCATION:
@@ -86,7 +81,6 @@ def get_ydl_opts(output_dir: str) -> dict:
 def download_single_audio(url: str, output_dir: str) -> tuple[bool, str, str]:
     try:
         opts = get_ydl_opts(output_dir)
-        opts["ignoreerrors"] = False
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if info is None:
@@ -174,15 +168,6 @@ def scrape_generic_videos(
     return results
 
 
-def build_zip(mp3_data: list[tuple[str, bytes]]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fname, fbytes in mp3_data:
-            zf.writestr(fname, fbytes)
-    buf.seek(0)
-    return buf.read()
-
-
 # ─────────────────────────────────────────────
 # Interface — onglets
 # ─────────────────────────────────────────────
@@ -265,8 +250,8 @@ with tab_multi:
         if not page_url_input.strip():
             st.error("Saisis une URL valide.")
         else:
-            # Réinitialisation complète
-            for key in ("entries", "batch_index", "mp3_data", "dl_logs"):
+            # Réinitialisation complète de la session
+            for key in ("entries", "queue", "processing_index", "results"):
                 st.session_state.pop(key, None)
 
             session = requests.Session()
@@ -283,11 +268,8 @@ with tab_multi:
                 )
 
             st.session_state["entries"] = entries
-            st.session_state["batch_index"] = 0
-            st.session_state["mp3_data"] = []   # list[tuple[str, bytes]]
-            st.session_state["dl_logs"] = []
 
-    # ── Étape 2 : Affichage de la liste ──────────────────────────────────────
+    # ── Étape 2 : Sélection par cases à cocher ───────────────────────────────
 
     entries: list | None = st.session_state.get("entries")
 
@@ -295,109 +277,146 @@ with tab_multi:
         if not entries:
             st.error("❌ Aucune vidéo trouvée.")
         else:
-            batch_index: int = st.session_state.get("batch_index", 0)
-            mp3_data: list = st.session_state.get("mp3_data", [])
             total = len(entries)
-            done = batch_index >= total
 
-            # Barre de progression globale
-            if batch_index > 0:
-                st.progress(min(batch_index / total, 1.0))
-                st.caption(
-                    f"**{len(mp3_data)} MP3 récupérés** sur {batch_index} tentées "
-                    f"({total - batch_index} restantes)"
-                    if not done
-                    else f"**Terminé — {len(mp3_data)} MP3** sur {total} tentatives."
-                )
+            # Initialise les cases cochées si pas encore fait
+            if "checked" not in st.session_state:
+                st.session_state["checked"] = [False] * total
 
-            with st.expander(f"📋 Liste des vidéos ({total})", expanded=(batch_index == 0)):
-                for url, title in entries:
-                    st.markdown(f"- **{title}** — `{url}`")
+            # Remet à la bonne taille si on a relancé une analyse
+            if len(st.session_state["checked"]) != total:
+                st.session_state["checked"] = [False] * total
 
-            # ── Bouton de lancement / continuation ───────────────────────────
+            # En cours de traitement automatique ?
+            is_processing = st.session_state.get("processing_index") is not None
 
-            if not done:
-                remaining = total - batch_index
-                label = (
-                    f"⬇️ Démarrer le téléchargement ({total} audios, par lots de {BATCH_SIZE})"
-                    if batch_index == 0
-                    else f"▶️ Continuer — lot suivant ({remaining} restants)"
-                )
+            if not is_processing:
+                # ── Interface de sélection ────────────────────────────────────
+                st.markdown(f"**{total} vidéo(s) trouvée(s)** — coche celles à télécharger :")
 
-                if st.button(label, key="btn_batch", type="primary"):
-                    batch_end = min(batch_index + BATCH_SIZE, total)
-                    batch = entries[batch_index:batch_end]
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    if st.button("☑️ Tout sélectionner"):
+                        st.session_state["checked"] = [True] * total
+                        st.rerun()
+                with col_b:
+                    if st.button("☐ Tout désélectionner"):
+                        st.session_state["checked"] = [False] * total
+                        st.rerun()
 
-                    dl_progress = st.progress(0)
-                    dl_status = st.empty()
-                    logs: list = st.session_state["dl_logs"]
-
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        for i, (url, title) in enumerate(batch, 1):
-                            label_short = (title or url)[:70]
-                            dl_status.text(
-                                f"⏳ {batch_index + i}/{total} — {label_short}…"
-                            )
-                            dl_progress.progress(i / len(batch))
-
-                            success, _, mp3_path = download_single_audio(url, tmpdir)
-
-                            if success and mp3_path and os.path.isfile(mp3_path):
-                                with open(mp3_path, "rb") as f:
-                                    st.session_state["mp3_data"].append(
-                                        (os.path.basename(mp3_path), f.read())
-                                    )
-                                logs.append(f"✅ {batch_index + i}/{total} — {label_short}")
-                            else:
-                                logs.append(
-                                    f"❌ {batch_index + i}/{total} — {label_short} → {mp3_path}"
-                                )
-
-                    dl_progress.empty()
-                    dl_status.empty()
-                    st.session_state["batch_index"] = batch_end
-                    st.session_state["dl_logs"] = logs
-                    st.rerun()
-
-            # ── Téléchargement final (ZIP) dès qu'il y a des fichiers ─────────
-
-            mp3_data = st.session_state.get("mp3_data", [])
-
-            if mp3_data:
                 st.divider()
 
-                # Journal des erreurs éventuelles
-                logs = st.session_state.get("dl_logs", [])
-                errors = [l for l in logs if l.startswith("❌")]
-                if errors:
-                    with st.expander(f"⚠️ {len(errors)} échec(s) — voir le journal"):
-                        st.text("\n".join(logs))
-
-                if done:
-                    st.success(f"✅ Tous les lots traités — **{len(mp3_data)} MP3** prêts.")
-                else:
-                    st.info(
-                        f"💡 **{len(mp3_data)} MP3 déjà disponibles.** "
-                        "Tu peux les télécharger maintenant ou continuer pour en récupérer plus."
+                for idx, (url, title) in enumerate(entries):
+                    st.session_state["checked"][idx] = st.checkbox(
+                        f"**{idx + 1}.** {title}",
+                        value=st.session_state["checked"][idx],
+                        key=f"chk_{idx}",
                     )
 
-                if len(mp3_data) == 1:
-                    st.download_button(
-                        label="💾 Télécharger le MP3",
-                        data=mp3_data[0][1],
-                        file_name=mp3_data[0][0],
-                        mime="audio/mpeg",
-                        type="primary",
-                    )
+                st.divider()
+
+                nb_selected = sum(st.session_state["checked"])
+                if nb_selected == 0:
+                    st.info("Coche au moins une vidéo pour lancer le téléchargement.")
                 else:
-                    zip_bytes = build_zip(mp3_data)
-                    st.download_button(
-                        label=f"📦 Télécharger l'archive ZIP ({len(mp3_data)} MP3)",
-                        data=zip_bytes,
-                        file_name="audios_senat.zip",
-                        mime="application/zip",
+                    if st.button(
+                        f"⬇️ Télécharger les {nb_selected} audio(s) sélectionné(s)",
                         type="primary",
-                    )
+                        key="btn_start_dl",
+                    ):
+                        # Construit la file d'attente à partir des cases cochées
+                        queue = [
+                            entries[i]
+                            for i, checked in enumerate(st.session_state["checked"])
+                            if checked
+                        ]
+                        st.session_state["queue"] = queue
+                        st.session_state["processing_index"] = 0
+                        st.session_state["results"] = []   # list[dict]
+                        st.rerun()
+
+            else:
+                # ── Traitement automatique un par un ─────────────────────────
+                queue: list = st.session_state["queue"]
+                idx: int = st.session_state["processing_index"]
+                results: list = st.session_state["results"]
+                total_q = len(queue)
+
+                # Affiche la progression globale
+                st.markdown(f"### ⏳ Traitement en cours… {idx}/{total_q}")
+                st.progress(idx / total_q)
+
+                # Affiche les fichiers déjà prêts
+                if results:
+                    st.markdown("---")
+                    st.markdown("**Fichiers prêts à télécharger :**")
+                    for r in results:
+                        if r["success"]:
+                            st.download_button(
+                                label=f"💾 {r['title']}",
+                                data=r["data"],
+                                file_name=r["filename"],
+                                mime="audio/mpeg",
+                                key=f"dl_done_{r['idx']}",
+                            )
+                        else:
+                            st.error(f"❌ {r['title']} — {r['error']}")
+
+                # Traite le fichier suivant dans la file
+                if idx < total_q:
+                    url, title = queue[idx]
+                    with st.spinner(f"🎵 {idx + 1}/{total_q} — {title[:70]}…"):
+                        with tempfile.TemporaryDirectory() as tmpdir:
+                            success, dl_title, mp3_path = download_single_audio(url, tmpdir)
+                            if success and mp3_path and os.path.isfile(mp3_path):
+                                with open(mp3_path, "rb") as f:
+                                    audio_data = f.read()
+                                results.append({
+                                    "idx": idx,
+                                    "success": True,
+                                    "title": dl_title or title,
+                                    "data": audio_data,
+                                    "filename": os.path.basename(mp3_path),
+                                })
+                            else:
+                                results.append({
+                                    "idx": idx,
+                                    "success": False,
+                                    "title": title,
+                                    "error": mp3_path,
+                                })
+
+                    st.session_state["results"] = results
+                    st.session_state["processing_index"] = idx + 1
+                    st.rerun()  # → passe automatiquement au fichier suivant
+
+                else:
+                    # ── Tout est terminé ──────────────────────────────────────
+                    nb_ok = sum(1 for r in results if r["success"])
+                    nb_err = total_q - nb_ok
+
+                    st.success(f"✅ Terminé — **{nb_ok} MP3** prêts"
+                               + (f" · {nb_err} échec(s)" if nb_err else "") + ".")
+                    st.progress(1.0)
+                    st.markdown("---")
+                    st.markdown("**Télécharge tes fichiers :**")
+
+                    for r in results:
+                        if r["success"]:
+                            st.download_button(
+                                label=f"💾 {r['title']}",
+                                data=r["data"],
+                                file_name=r["filename"],
+                                mime="audio/mpeg",
+                                key=f"dl_final_{r['idx']}",
+                            )
+                        else:
+                            st.error(f"❌ {r['title']} — {r['error']}")
+
+                    if st.button("🔄 Nouvelle sélection", key="btn_reset"):
+                        for key in ("queue", "processing_index", "results", "checked"):
+                            st.session_state.pop(key, None)
+                        st.rerun()
 
 # ─────────────────────────────────────────────
 # Pied de page
